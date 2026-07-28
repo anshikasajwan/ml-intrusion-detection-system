@@ -15,6 +15,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.metrics import (
     classification_report, confusion_matrix, accuracy_score,
@@ -95,7 +96,10 @@ def preprocess(train_df, test_df):
 
 def run_supervised(X_train, y_train, X_test, y_test):
     print("\n=== Supervised: Decision Tree (known attack classification) ===")
-    clf = DecisionTreeClassifier(max_depth=12, random_state=42)
+    # class_weight='balanced' makes the tree pay more attention to rare
+    # classes (R2L, U2R) instead of just optimizing overall accuracy,
+    # which would otherwise be dominated by the large 'normal' and 'dos' classes.
+    clf = DecisionTreeClassifier(max_depth=12, class_weight="balanced", random_state=42)
     clf.fit(X_train, y_train)
     preds = clf.predict(X_test)
 
@@ -106,11 +110,47 @@ def run_supervised(X_train, y_train, X_test, y_test):
     return clf
 
 
+def run_random_forest(X_train, y_train, X_test, y_test, feature_cols):
+    """
+    Random Forest as a stronger supervised baseline: an ensemble of many
+    trees trained on random feature/data subsets, which usually
+    generalizes better than a single Decision Tree, especially on
+    minority classes.
+    """
+    print("\n=== Supervised: Random Forest (comparison baseline) ===")
+    clf = RandomForestClassifier(
+        n_estimators=200, max_depth=20, class_weight="balanced",
+        random_state=42, n_jobs=-1
+    )
+    clf.fit(X_train, y_train)
+    preds = clf.predict(X_test)
+
+    print("Accuracy:", accuracy_score(y_test, preds))
+    print("\nClassification report (per category):")
+    print(classification_report(y_test, preds, zero_division=0))
+    print("Confusion matrix:\n", confusion_matrix(y_test, preds))
+
+    # Which features actually drive the model's decisions
+    importances = pd.Series(clf.feature_importances_, index=feature_cols)
+    print("\nTop 10 most important features:")
+    print(importances.sort_values(ascending=False).head(10))
+
+    return clf
+
+
 def run_anomaly_detection(X_train, train_category, X_test, y_test_binary):
     """
     Train K-Means ONLY on normal traffic. At inference, measure distance
     to nearest cluster centroid; large distance = anomaly = potential
     unknown/zero-day attack.
+
+    The distance threshold controls the precision/recall tradeoff:
+      - Higher percentile (e.g. 99th) -> stricter -> higher precision,
+        lower recall (misses more attacks, but fewer false alarms)
+      - Lower percentile (e.g. 85th)  -> looser -> higher recall,
+        lower precision (catches more attacks, but more false alarms)
+    We test several thresholds so you can see and justify the tradeoff
+    rather than picking one arbitrarily.
     """
     print("\n=== Unsupervised: K-Means anomaly detection (zero-day proxy) ===")
     normal_mask = train_category == "normal"
@@ -119,27 +159,40 @@ def run_anomaly_detection(X_train, train_category, X_test, y_test_binary):
     kmeans = KMeans(n_clusters=8, random_state=42, n_init=10)
     kmeans.fit(X_normal)
 
-    # distance of each test point to its nearest centroid
     distances = np.min(kmeans.transform(X_test), axis=1)
-
-    # threshold = e.g. 95th percentile of distances seen on normal training data
     train_distances = np.min(kmeans.transform(X_normal), axis=1)
-    threshold = np.percentile(train_distances, 95)
 
-    preds_anomaly = (distances > threshold).astype(int)  # 1 = flagged as attack
+    results = []
+    for pct in [80, 85, 90, 95, 99]:
+        threshold = np.percentile(train_distances, pct)
+        preds_anomaly = (distances > threshold).astype(int)
 
-    print(f"Distance threshold (95th pct of normal): {threshold:.3f}")
-    print("Precision:", precision_score(y_test_binary, preds_anomaly))
-    print("Recall:", recall_score(y_test_binary, preds_anomaly))
-    print("F1:", f1_score(y_test_binary, preds_anomaly))
-    print("Confusion matrix:\n", confusion_matrix(y_test_binary, preds_anomaly))
-    return kmeans, threshold
+        p = precision_score(y_test_binary, preds_anomaly, zero_division=0)
+        r = recall_score(y_test_binary, preds_anomaly, zero_division=0)
+        f1 = f1_score(y_test_binary, preds_anomaly, zero_division=0)
+        results.append((pct, threshold, p, r, f1))
+
+        print(f"\n--- Threshold: {pct}th percentile (distance > {threshold:.3f}) ---")
+        print(f"Precision: {p:.3f}  Recall: {r:.3f}  F1: {f1:.3f}")
+        print("Confusion matrix:\n", confusion_matrix(y_test_binary, preds_anomaly))
+
+    print("\n=== Threshold comparison summary ===")
+    summary = pd.DataFrame(
+        results, columns=["percentile", "distance_threshold", "precision", "recall", "f1"]
+    )
+    print(summary.to_string(index=False))
+
+    best = summary.loc[summary["f1"].idxmax()]
+    print(f"\nBest F1 at {int(best['percentile'])}th percentile "
+          f"(precision={best['precision']:.3f}, recall={best['recall']:.3f})")
+
+    return kmeans, summary
 
 
 if __name__ == "__main__":
     # Update these paths to wherever you downloaded the NSL-KDD files
-    train_df = load_data("KDDTrain+.txt")
-    test_df = load_data("KDDTest+.txt")
+    train_df = load_data("data/KDDTrain+.txt")
+    test_df = load_data("data/KDDTest+.txt")
 
     X_train, X_test, feature_cols, scaler = preprocess(train_df, test_df)
 
@@ -147,6 +200,7 @@ if __name__ == "__main__":
     y_train_cat = train_df["category"]
     y_test_cat = test_df["category"]
     run_supervised(X_train, y_train_cat, X_test, y_test_cat)
+    run_random_forest(X_train, y_train_cat, X_test, y_test_cat, feature_cols)
 
     # --- Unsupervised task: normal vs anomaly (binary) ---
     y_test_binary = (test_df["category"] != "normal").astype(int)
